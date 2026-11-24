@@ -1,0 +1,30 @@
+# Windows build output, download cache and generated OCR runtime
+/build/
+/dist/
+/ocr_runtime/
+
+# Python environments and caches
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+/htmlcov/
+
+# Local editor settings, credentials and temporary files
+/.idea/
+/.vscode/
+.env
+.env.*
+!.env.example
+*.local.json
+*.log
+*.tmp
+*.swp
+Thumbs.db
+Desktop.ini
