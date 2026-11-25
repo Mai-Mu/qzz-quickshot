@@ -1,4 +1,4 @@
-"""Pixel loupe for the frozen screenshot under the capture pointer."""
+"""Pixel loupe for the frozen screenshot at the active capture corner."""
 
 from math import floor
 
@@ -34,6 +34,16 @@ def _position(point: QPoint, size: QSize, viewport: QSize, obstacles: tuple[QRec
         footprint = QRect(candidate, size)
         if limits.contains(footprint) and not any(footprint.intersects(rect) for rect in obstacles):
             return candidate
+    # Near a screen edge, slide along it to keep both the sample and controls visible.
+    protected = (*obstacles, QRect(point - QPoint(8, 8), QSize(17, 17)))
+    for candidate in candidates:
+        moved = QPoint(
+            max(limits.left(), min(candidate.x(), limits.right() - size.width() + 1)),
+            max(limits.top(), min(candidate.y(), limits.bottom() - size.height() + 1)),
+        )
+        footprint = QRect(moved, size)
+        if limits.contains(footprint) and not any(footprint.intersects(rect) for rect in protected):
+            return moved
     for candidate in candidates:
         if limits.contains(QRect(candidate, size)):
             return candidate
@@ -57,7 +67,7 @@ class PixelMagnifier(QWidget):
         self._selection = QRect()
         self._color = QColor()
         self._hex = False
-        self._pending: tuple[QPointF, QSize, QRect, tuple[QRect, ...]] | None = None
+        self._pending: tuple[QPointF, QSize, QRect, tuple[QRect, ...], QPoint | None] | None = None
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(8)
@@ -66,14 +76,14 @@ class PixelMagnifier(QWidget):
 
     def inspect(
         self, frame: QImage, viewport: QSize, point: QPointF,
-        selection: QRect, obstacles: tuple[QRect, ...],
+        selection: QRect, obstacles: tuple[QRect, ...], *, sample: QPoint | None = None,
     ) -> None:
         key = frame.cacheKey()
         if key != self._source_key:
             self._source_key = key
             self._source = frame
             self._color = QColor()
-        self._pending = point, viewport, selection, obstacles
+        self._pending = point, viewport, selection, obstacles, sample
         if not self.isVisible():
             self._refresh()
             self.raise_()
@@ -84,15 +94,23 @@ class PixelMagnifier(QWidget):
     def _refresh(self) -> None:
         if self._pending is None:
             return
-        point, viewport, selection, obstacles = self._pending
+        point, viewport, selection, obstacles, sample = self._pending
         self._pending = None
-        pixel = source_pixel(self._source, viewport, point)
+        pixel = sample if sample is not None else source_pixel(self._source, viewport, point)
         if pixel != self._pixel or selection != self._selection or not self._color.isValid():
             self._pixel = pixel
             self._selection = selection
             self._color = self._source.pixelColor(pixel)
             self.update()
-        position = _position(point.toPoint(), self.size(), viewport, obstacles)
+        pointer = point.toPoint()
+        anchor = pointer
+        if sample is not None:
+            anchor = QPoint(
+                round((sample.x() + 0.5) * viewport.width() / self._source.width()),
+                round((sample.y() + 0.5) * viewport.height() / self._source.height()),
+            )
+            obstacles += (QRect(pointer - QPoint(8, 8), QSize(17, 17)),)
+        position = _position(anchor, self.size(), viewport, obstacles)
         if position != self.pos():
             self.move(position)
 

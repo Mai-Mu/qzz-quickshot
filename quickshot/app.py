@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QLockFile, QRect, QSettings, QStandardPaths, QTimer, Qt
+from PySide6.QtCore import QLockFile, QRect, QSettings, QSize, QStandardPaths, QTimer, Qt
 from PySide6.QtGui import QFont, QIcon, QImage, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -198,8 +198,9 @@ class Quickshot:
     def _copy_image(self, image: QImage) -> None:
         self._app.clipboard().setImage(image)
 
-    def _image_saved(self, path: str) -> None:
-        self._tray.showMessage("截图已保存", Path(path).name, QSystemTrayIcon.MessageIcon.Information, 3000)
+    def _image_saved(self, path: str, size: QSize, size_bytes: int) -> None:
+        details = f"{Path(path).name}\n{size.width()} × {size.height()} px · {size_bytes / 1000:.1f} KB"
+        self._tray.showMessage("截图已保存", details, QSystemTrayIcon.MessageIcon.Information, 3000)
 
     def _pin_image(self, image: QImage, geometry: QRect | None = None) -> None:
         pin = PinnedImage(image, geometry)

@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from functools import cache
-from math import hypot
+from math import ceil, hypot
 from threading import Event
 
 from PySide6.QtCore import (
+    QEvent,
     QObject,
     QPoint,
     QPointF,
     QRect,
     QRectF,
     QRunnable,
+    QSize,
     QThreadPool,
     QTimer,
     Qt,
@@ -31,6 +34,20 @@ logger = logging.getLogger(__name__)
 _TEXT_HIGHLIGHT = QColor(18, 158, 170, 100)
 _SHADOW_PADDING = 8
 _SHADOW_PATCHES = ((0, 0), (0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1), (2, 2))
+_RESIZE_EDGE = 5
+_MIN_ZOOM = 0.1
+_MAX_ZOOM = 5.0
+_WHEEL_ZOOM = 1.1
+_WHEEL_FRAME_INTERVAL = 12
+
+
+@dataclass(frozen=True)
+class _ResizeDrag:
+    start: QPointF
+    zoom: float
+    anchor: QPointF
+    alignment: QPointF
+    axis: QPointF
 
 
 @cache
@@ -50,8 +67,8 @@ def _draw_shadow(painter: QPainter, image_rect: QRectF) -> None:
     padding = _SHADOW_PADDING
     stamp = _shadow_stamp()
     source = (0, padding, padding + 1, stamp.width())
-    target_x = (0, padding, image_rect.right(), image_rect.right() + padding)
-    target_y = (0, padding, image_rect.bottom(), image_rect.bottom() + padding)
+    target_x = (0, image_rect.left(), image_rect.right(), image_rect.right() + image_rect.left())
+    target_y = (0, image_rect.top(), image_rect.bottom(), image_rect.bottom() + image_rect.top())
     for row, column in _SHADOW_PATCHES:
         source_rect = QRectF(
             source[column], source[row],
@@ -148,29 +165,38 @@ class PinnedImage(QWidget):
         self._press_position = QPoint()
         self._drag_offset = QPoint()
         self._moving_window = False
+        self._resize_drag: _ResizeDrag | None = None
+        self._zoom = 1.0
+        self._pending_wheel: tuple[int, QPointF, QPointF] | None = None
+        self._wheel_timer = QTimer(self)
+        self._wheel_timer.setSingleShot(True)
+        self._wheel_timer.setInterval(_WHEEL_FRAME_INTERVAL)
+        self._wheel_timer.timeout.connect(self._apply_wheel_zoom)
+        self._zoom_timer = QTimer(self)
+        self._zoom_timer.setSingleShot(True)
+        self._zoom_timer.setInterval(1100)
+        self._zoom_timer.timeout.connect(self.update)
 
         location = geometry.center() if geometry is not None else QCursor.pos()
         screen = QApplication.screenAt(location) or QApplication.primaryScreen()
+        self.winId()
+        self.windowHandle().setScreen(screen)
         if geometry is None:
             available = screen.availableGeometry()
-            scale = min(
-                1 / screen.devicePixelRatio(),
-                0.84 * available.width() / max(1, self._image.width()),
-                0.84 * available.height() / max(1, self._image.height()),
+            ratio = self.devicePixelRatioF()
+            self._zoom = min(
+                1.0,
+                0.84 * available.width() * ratio / max(1, self._image.width()),
+                0.84 * available.height() * ratio / max(1, self._image.height()),
             )
-            width = max(1, round(self._image.width() * scale))
-            height = max(1, round(self._image.height() * scale))
+            width = max(1, ceil(self._image.width() * self._zoom / ratio))
+            height = max(1, ceil(self._image.height() * self._zoom / ratio))
             left = max(available.left(), min(location.x(), available.right() + 1 - width))
             top = max(available.top(), min(location.y(), available.bottom() + 1 - height))
             geometry = QRect(left, top, width, height)
 
-        padding = _SHADOW_PADDING
-        self._image_rect = QRectF(padding, padding, geometry.width(), geometry.height())
-        window_geometry = geometry.adjusted(-padding, -padding, padding, padding)
-        self.winId()
-        self.windowHandle().setScreen(screen)
-        self.setFixedSize(window_geometry.size())
-        self.move(window_geometry.topLeft())
+        self._layout_image(QPointF(geometry.topLeft()), QPointF())
+        self.windowHandle().installEventFilter(self)
 
     def _start_recognition(self) -> None:
         if self._cancelled.is_set():
@@ -193,7 +219,35 @@ class PinnedImage(QWidget):
 
     def closeEvent(self, event) -> None:
         self._cancelled.set()
+        self._wheel_timer.stop()
         super().closeEvent(event)
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() == QEvent.Type.DevicePixelRatioChange:
+            QTimer.singleShot(0, self, self._sync_device_scale)
+        return super().eventFilter(watched, event)
+
+    def _sync_device_scale(self) -> None:
+        if self._image_dpr != self.devicePixelRatioF():
+            self._layout_image(self._global_image_origin(), QPointF())
+            self.repaint()
+
+    def _global_image_origin(self) -> QPointF:
+        return QPointF(self.pos()) + self._image_rect.topLeft()
+
+    def _layout_image(self, anchor: QPointF, alignment: QPointF) -> None:
+        ratio = self.devicePixelRatioF()
+        self._image_dpr = ratio
+        # Put both edges of the image on physical pixels, including at 125% and 150% DPI.
+        inset = round(_SHADOW_PADDING * ratio) / ratio
+        width = max(1, round(self._image.width() * self._zoom)) / ratio
+        height = max(1, round(self._image.height() * self._zoom)) / ratio
+        self._image_rect = QRectF(inset, inset, width, height)
+        origin = anchor - QPointF(inset + alignment.x() * width, inset + alignment.y() * height)
+        size = QSize(ceil(width + 2 * inset), ceil(height + 2 * inset))
+        window_geometry = QRect(origin.toPoint(), size)
+        if window_geometry != self.geometry():
+            self.setGeometry(window_geometry)
 
     def _point_in_image(self, point: QPointF) -> QPointF:
         return QPointF(
@@ -253,6 +307,7 @@ class PinnedImage(QWidget):
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         _draw_shadow(painter, self._image_rect)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
         painter.drawImage(self._image_rect, self._image)
         painter.setClipRect(self._image_rect)
 
@@ -261,6 +316,11 @@ class PinnedImage(QWidget):
             self._recognition_started = True
             QTimer.singleShot(0, self, self._start_recognition)
 
+        self._draw_text_selection(painter)
+        if self._resize_drag is not None or self._zoom_timer.isActive():
+            self._draw_zoom_label(painter)
+
+    def _draw_text_selection(self, painter: QPainter) -> None:
         start, end = self._selection()
         if start == end:
             return
@@ -275,22 +335,95 @@ class PinnedImage(QWidget):
             )
             painter.fillRect(self._rectangle_on_screen(bounds), _TEXT_HIGHLIGHT)
 
+    def _draw_zoom_label(self, painter: QPainter) -> None:
+        text = f"{round(self._zoom * 100)}%"
+        metrics = painter.fontMetrics()
+        badge = QRectF(
+            self._image_rect.left() + 3, self._image_rect.top() + 3,
+            metrics.horizontalAdvance(text) + 10, metrics.height() + 4,
+        )
+        painter.setPen(QColor("#ccd9db"))
+        painter.setBrush(QColor(252, 253, 253, 245))
+        painter.drawRoundedRect(badge, 3, 3)
+        painter.setPen(QColor("#183438"))
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _resize_edges(self, point: QPointF) -> tuple[int, int]:
+        rect = self._image_rect
+        if not rect.contains(point):
+            return 0, 0
+        edge_x = min(_RESIZE_EDGE, rect.width() / 4)
+        edge_y = min(_RESIZE_EDGE, rect.height() / 4)
+        horizontal = -1 if point.x() - rect.left() < edge_x else int(rect.right() - point.x() <= edge_x)
+        vertical = -1 if point.y() - rect.top() < edge_y else int(rect.bottom() - point.y() <= edge_y)
+        return horizontal, vertical
+
+    def _set_zoom(self, scale: float, anchor: QPointF, alignment: QPointF) -> None:
+        available = self.screen().availableGeometry()
+        ratio = self.devicePixelRatioF()
+        upper = min(
+            _MAX_ZOOM,
+            max(1.0, 2 * available.width() * ratio / max(1, self._image.width())),
+            max(1.0, 2 * available.height() * ratio / max(1, self._image.height())),
+        )
+        scale = max(_MIN_ZOOM, min(upper, scale))
+        if scale == self._zoom:
+            self.update()
+            return
+        self._zoom = scale
+        self._layout_image(anchor, alignment)
+        # Submit the full alpha surface in the same turn as the native resize.
+        self.repaint()
+
+    def _resize_to_cursor(self, drag: _ResizeDrag, position: QPointF) -> None:
+        delta = position - drag.start
+        change = QPointF.dotProduct(delta, drag.axis) / QPointF.dotProduct(drag.axis, drag.axis)
+        self._set_zoom(drag.zoom * (1 + change), drag.anchor, drag.alignment)
+
     def _update_cursor(self, position: QPointF) -> None:
+        horizontal, vertical = self._resize_edges(position)
         if not self._image_rect.contains(position):
             self.unsetCursor()
+        elif horizontal and vertical:
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor if horizontal == vertical
+                           else Qt.CursorShape.SizeBDiagCursor)
+        elif horizontal:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif vertical:
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
         elif self._line_at(self._point_in_image(position)) is not None:
             self.setCursor(Qt.CursorShape.IBeamCursor)
         else:
             self.setCursor(Qt.CursorShape.OpenHandCursor)
 
     def mousePressEvent(self, event) -> None:
-        if event.button() != Qt.MouseButton.LeftButton or not self._image_rect.contains(event.position()):
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        position = event.position()
+        if self._pending_wheel is not None:
+            self._wheel_timer.stop()
+            self._apply_wheel_zoom()
+            position = event.globalPosition() - self.pos()
+        if not self._image_rect.contains(position):
             super().mousePressEvent(event)
             return
         self.setFocus(Qt.FocusReason.MouseFocusReason)
 
         alt_pressed = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
-        point = self._point_in_image(event.position())
+        horizontal, vertical = self._resize_edges(position)
+        if not alt_pressed and (horizontal or vertical):
+            rect = self._image_rect.translated(QPointF(self.pos()))
+            alignment = QPointF((1 - horizontal) / 2, (1 - vertical) / 2)
+            anchor = rect.topLeft() + QPointF(alignment.x() * rect.width(), alignment.y() * rect.height())
+            axis = QPointF(horizontal * rect.width(), vertical * rect.height())
+            self._resize_drag = _ResizeDrag(event.globalPosition(), self._zoom, anchor, alignment, axis)
+            self._gesture = "resize"
+            self.update()
+            event.accept()
+            return
+
+        point = self._point_in_image(position)
         line = self._line_at(point)
         if line is not None and not alt_pressed:
             self._gesture = "select"
@@ -307,7 +440,10 @@ class PinnedImage(QWidget):
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:
-        if self._gesture == "select":
+        drag = self._resize_drag
+        if drag is not None:
+            self._resize_to_cursor(drag, event.globalPosition())
+        elif self._gesture == "select":
             self._update_selection(event.position())
         elif self._gesture == "move":
             position = event.globalPosition().toPoint()
@@ -326,13 +462,42 @@ class PinnedImage(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            if self._gesture == "select":
+            drag = self._resize_drag
+            if drag is not None:
+                self._resize_to_cursor(drag, event.globalPosition())
+                self._resize_drag = None
+                self._zoom_timer.start()
+            elif self._gesture == "select":
                 self._update_selection(event.position())
             self._gesture = ""
-            self._update_cursor(event.position())
+            self._update_cursor(event.globalPosition() - self.pos())
             event.accept()
         else:
             super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event) -> None:
+        rect = self._image_rect
+        point = event.position()
+        delta = event.angleDelta().y() or event.pixelDelta().y()
+        if self._gesture or not delta or not rect.contains(point):
+            super().wheelEvent(event)
+            return
+        alignment = QPointF((point.x() - rect.left()) / rect.width(), (point.y() - rect.top()) / rect.height())
+        if self._pending_wheel is not None:
+            delta += self._pending_wheel[0]
+        self._pending_wheel = delta, event.globalPosition(), alignment
+        if not self._wheel_timer.isActive():
+            self._wheel_timer.start()
+        event.accept()
+
+    def _apply_wheel_zoom(self) -> None:
+        pending, self._pending_wheel = self._pending_wheel, None
+        if pending is None or self._gesture:
+            return
+        delta, anchor, alignment = pending
+        self._zoom_timer.start()
+        self._set_zoom(self._zoom * _WHEEL_ZOOM ** (delta / 120), anchor, alignment)
+        self._update_cursor(anchor - self.pos())
 
     def _copy_text(self) -> None:
         text = self._text.selected_text(*self._selection())

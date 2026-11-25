@@ -68,11 +68,17 @@ def _width(mark: Mark) -> float:
     return float(max(1, mark.style.width))
 
 
+def annotation_font(style: AnnotationStyle) -> QFont:
+    """Use the same glyph metrics for editing and rendering a text annotation."""
+    font = QFont("Microsoft YaHei UI")
+    font.setPixelSize(max(1, style.size))
+    font.setWeight(QFont.Weight.DemiBold)
+    return font
+
+
 def _text_path(mark: Mark) -> QPainterPath:
     path = QPainterPath()
-    font = QFont("Microsoft YaHei UI")
-    font.setPixelSize(max(1, mark.style.size))
-    font.setWeight(QFont.Weight.DemiBold)
+    font = annotation_font(mark.style)
     metrics = QFontMetricsF(font)
     anchor = mark.points[0]
     baseline = anchor.y() + metrics.ascent()

@@ -31,17 +31,18 @@ from PySide6.QtGui import (
     QColor,
     QCursor,
     QEnterEvent,
-    QFont,
     QFontMetricsF,
     QGuiApplication,
     QIcon,
     QImage,
+    QInputMethodEvent,
     QKeyEvent,
     QKeySequence,
     QMouseEvent,
     QPaintEvent,
     QPainter,
     QPainterPath,
+    QPalette,
     QPen,
     QPixmap,
     QRegion,
@@ -62,7 +63,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .annotations import AnnotationLayer, AnnotationStyle, Mark
+from .annotations import AnnotationLayer, AnnotationStyle, Mark, annotation_font
 from .cursors import CROSSHAIR, CanvasCursors, Pointer, ToolPointer, is_canvas_cursor_message
 from .magnifier import PixelMagnifier
 from .qr import decode_qr
@@ -112,6 +113,8 @@ _AREA_TOOLS = {"rectangle", "ellipse", "mosaic", "blur"}
 _PATH_TOOLS = {"pen", "highlight", "eraser", "mosaic_brush"}
 _BRUSH_CURSORS = {"pen": "pen", "eraser": "eraser", "mosaic_brush": "eraser"}
 _ENDPOINT_TOOLS = {"arrow", "line"}
+_TEXT_OUTLINE_PADDING = 3
+_TEXT_OUTLINE_HIT = 3
 
 
 @dataclass(slots=True)
@@ -228,10 +231,55 @@ class _QrScan(QRunnable):
             return
 
 
+class _InlineTextEditor(QLineEdit):
+    composition_changed = Signal()
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.preedit = ""
+        self._ink = QColor()
+        self.setFrame(False)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignAbsolute | Qt.AlignmentFlag.AlignTop)
+        self.setStyleSheet("QLineEdit { background: transparent; border: none; padding: 0; }")
+        # Align the standard Qt IME and caret with the canvas glyph origin.
+        self.setTextMargins(-2, -1, 0, 0)
+
+    def set_ink(self, ink: QColor) -> None:
+        if ink != self._ink:
+            self._ink = ink
+            self._update_palette()
+
+    def _update_palette(self) -> None:
+        palette = self.palette()
+        text = self._ink if self.preedit else QColor(Qt.GlobalColor.transparent)
+        palette.setColor(QPalette.ColorRole.Text, text)
+        palette.setColor(QPalette.ColorRole.HighlightedText, text)
+        palette.setColor(QPalette.ColorRole.Highlight, QColor(21, 171, 181, 68))
+        self.setPalette(palette)
+
+    def inputMethodEvent(self, event: QInputMethodEvent) -> None:
+        was_composing = bool(self.preedit)
+        self.preedit = event.preeditString()
+        if bool(self.preedit) != was_composing:
+            self._update_palette()
+        super().inputMethodEvent(event)
+        self.composition_changed.emit()
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        # The canvas paints committed input. Qt paints input-method composition and selection.
+        super().paintEvent(event)
+        if not self.preedit and self.hasFocus() and not self.hasSelectedText():
+            caret = self.cursorRect()
+            painter = QPainter(self)
+            painter.setPen(QPen(QColor("#087e86"), 1.0))
+            x = max(0, caret.center().x())
+            painter.drawLine(x, caret.top(), x, caret.bottom())
+
+
 class CaptureOverlay(QWidget):
     image_copied = Signal(QImage)
     image_pinned = Signal(QImage, QRect)
-    image_saved = Signal(str)
+    image_saved = Signal(str, QSize, int)
 
     def __init__(self) -> None:
         super().__init__(
@@ -242,6 +290,9 @@ class CaptureOverlay(QWidget):
         self.setWindowTitle("瞬截")
         self._cursors = CanvasCursors()
         self._cursors.apply_qt(self, CROSSHAIR)
+        self._cursor_refresh_timer = QTimer(self)
+        self._cursor_refresh_timer.setSingleShot(True)
+        self._cursor_refresh_timer.timeout.connect(self._refresh_cursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
@@ -262,6 +313,8 @@ class CaptureOverlay(QWidget):
         self._polyline_cursor: QPointF | None = None
         self._text_anchor: QPointF | None = None
         self._text_index: int | None = None
+        self._text_outline = QRectF()
+        self._text_drag_offset: QPointF | None = None
         self._revision = 0
         self._qr_pool = QThreadPool(self)
         self._qr_pool.setMaxThreadCount(1)
@@ -328,20 +381,17 @@ class CaptureOverlay(QWidget):
         self._qr_status_timer.setInterval(1800)
         self._qr_status_timer.timeout.connect(self._qr_status.hide)
 
-        self._text_editor = QLineEdit(self)
+        self._text_editor = _InlineTextEditor(self)
         self._text_editor.setObjectName("annotationTextInput")
         self._text_editor.setAccessibleName("标注文字")
-        self._text_editor.setPlaceholderText("输入标注文字，按 Enter 确认")
-        self._text_editor.setStyleSheet(
-            "QLineEdit { background: white; color: #223039; border: 2px solid #087e86;"
-            " border-radius: 5px; padding: 4px 8px; }"
-        )
-        self._text_editor.returnPressed.connect(self._commit_text)
+        self._text_editor.setMouseTracking(True)
+        self._text_editor.textChanged.connect(self._update_text_editor)
+        self._text_editor.composition_changed.connect(self._update_text_editor)
+        self._text_editor.returnPressed.connect(self._accept_text)
         text_cancel = QShortcut(QKeySequence("Esc"), self._text_editor)
         text_cancel.setContext(Qt.ShortcutContext.WidgetShortcut)
         text_cancel.activated.connect(self._cancel_text)
         self._text_editor.hide()
-        self._cursor_controls = (self._toolbar, self._info, self._side_tools, self._text_editor)
         for control in self.findChildren(QWidget):
             control.installEventFilter(self)
         self._capture_shortcuts: list[QShortcut] = []
@@ -406,23 +456,32 @@ class CaptureOverlay(QWidget):
         if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.RightButton:
             self._right_click(QPointF(self.mapFromGlobal(event.globalPosition().toPoint())))
             return True
-        if watched in self._cursor_controls:
-            if event.type() == QEvent.Type.Enter:
-                self._magnifier.dismiss()
-            elif event.type() == QEvent.Type.Leave:
-                self._schedule_cursor_refresh()
+        if watched is self._text_editor and event.type() in {
+            QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease, QEvent.Type.MouseButtonDblClick,
+            QEvent.Type.MouseMove,
+        }:
+            point = self.mapFromGlobal(event.globalPosition())
+            if self._handle_text_drag(event, point):
+                return True
+            if event.type() == QEvent.Type.MouseMove:
+                self._update_cursor(point)
+        if event.type() == QEvent.Type.Enter:
+            self._magnifier.dismiss()
+            self._schedule_cursor_refresh()
+        elif event.type() == QEvent.Type.Leave:
+            self._schedule_cursor_refresh()
         return super().eventFilter(watched, event)
 
     def nativeEvent(self, event_type, message):
         if is_canvas_cursor_message(event_type, message) and self.isVisible():
             point = QPointF(self.mapFromGlobal(QCursor.pos()))
-            pointer = self._canvas_pointer(point)
-            if pointer is not None and self._cursors.apply_native(self, pointer):
+            target = self._pointer_at(point)
+            if target is not None and self._cursors.apply_native(self, target[0]):
                 return True, 1
         return super().nativeEvent(event_type, message)
 
     def _schedule_cursor_refresh(self) -> None:
-        QTimer.singleShot(0, self, self._refresh_cursor)
+        self._cursor_refresh_timer.start(0)
 
     @Slot()
     def _refresh_cursor(self) -> None:
@@ -434,19 +493,37 @@ class CaptureOverlay(QWidget):
 
     def _update_magnifier(self, point: QPointF) -> None:
         location = point.toPoint()
-        if (self._frame.isNull() or not self.rect().contains(location) or self._mark_drag is not None
+        if (self._frame.isNull() or self._mark_drag is not None
+                or (self._origin is None and not QRectF(self.rect()).contains(point))
                 or self._text_editor.isVisible() or QApplication.activePopupWidget() or QApplication.activeModalWidget()
                 or (self._move_base is not None and not self._magnifier_hold)
                 or (self._origin is None and self.childAt(location) is not None)):
             self._magnifier.dismiss()
             return
-        if (self._origin is None and not self._crop.isNull() and not self._magnifier_hold
-                and self._handle_at(point) is None):
+        handle = self._resize_handle or self._handle_at(point)
+        if self._origin is None and not self._crop.isNull() and not self._magnifier_hold and handle is None:
             self._magnifier.dismiss()
             return
         controls = self._toolbar, self._info, self._side_tools
         obstacles = tuple(widget.geometry() for widget in controls if widget.isVisible())
-        self._magnifier.inspect(self._frame, self.size(), point, self._physical_crop(), obstacles)
+        crop = self._physical_crop()
+        sample = None if crop.isEmpty() else self._magnifier_corner(point, crop, handle or "")
+        self._magnifier.inspect(self._frame, self.size(), point, crop, obstacles, sample=sample)
+
+    def _magnifier_corner(self, point: QPointF, crop: QRect, handle: str) -> QPoint:
+        center = self._selection.center()
+        if self._origin is not None:
+            if self._resize_handle is not None:
+                # For edge handles, keep the same corner throughout the resize.
+                point = self._origin
+            elif self._move_base is None:
+                # For a new selection, follow the corner opposite the drag origin.
+                point = center
+                center = self._origin
+        east = "e" in handle or ("w" not in handle and point.x() >= center.x())
+        south = "s" in handle or ("n" not in handle and point.y() >= center.y())
+        # QRect's bottom and right edges are inclusive and identify the last pixels in the crop.
+        return QPoint(crop.right() if east else crop.left(), crop.bottom() if south else crop.top())
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if isinstance(QApplication.focusWidget(), QLineEdit):
@@ -487,6 +564,8 @@ class CaptureOverlay(QWidget):
             return
         if event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event)
+            return
+        if self._handle_text_drag(event, event.position()):
             return
 
         self._commit_text()
@@ -546,6 +625,8 @@ class CaptureOverlay(QWidget):
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         point = event.position()
+        if self._handle_text_drag(event, point):
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._selection.contains(point):
             if self._tool == "polyline" and self._polyline_points:
                 self._append_polyline(point)
@@ -562,6 +643,8 @@ class CaptureOverlay(QWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         point = event.position()
+        if self._handle_text_drag(event, point):
+            return
         if self._origin is not None:
             self._update_selection(point)
         elif self._mark_drag is not None:
@@ -579,6 +662,8 @@ class CaptureOverlay(QWidget):
             super().mouseReleaseEvent(event)
             return
         point = event.position()
+        if self._handle_text_drag(event, point):
+            return
         if self._origin is not None:
             self._update_selection(point)
             self._origin = None
@@ -589,6 +674,7 @@ class CaptureOverlay(QWidget):
             self._update_mark(self._annotation_point(point))
             self._finish_mark()
         self._update_cursor(point)
+        self._schedule_cursor_refresh()
         self._update_magnifier(point)
 
     def _handle_at(self, point: QPointF) -> str | None:
@@ -666,13 +752,25 @@ class CaptureOverlay(QWidget):
             self._info.hide()
         self.update(_selection_outline(self._selection))
 
-    def _canvas_pointer(self, point: QPointF) -> Pointer | None:
+    def _pointer_at(self, point: QPointF) -> tuple[Pointer, bool] | None:
         location = point.toPoint()
         if not self.rect().contains(location) or QApplication.activePopupWidget() or QApplication.activeModalWidget():
             return None
-        if self._origin is None and self._mark_drag is None and self.childAt(location) is not None:
-            return None
+        if self._text_drag_offset is not None:
+            return Qt.CursorShape.SizeAllCursor, False
+        if self._origin is None and self._mark_drag is None:
+            control = self.childAt(location)
+            if control is self._text_editor:
+                cursor = Qt.CursorShape.SizeAllCursor if self._over_text_outline(point) else Qt.CursorShape.IBeamCursor
+                return cursor, True
+            if control is not None:
+                # Qt child widgets share our HWND, so WM_SETCURSOR also needs their cursor.
+                return control.cursor().shape(), True
+        return self._canvas_pointer(point), False
 
+    def _canvas_pointer(self, point: QPointF) -> Pointer:
+        if self._over_text_outline(point):
+            return Qt.CursorShape.SizeAllCursor
         handle = self._resize_handle or self._handle_at(point)
         if handle is not None:
             return _RESIZE_CURSORS[handle]
@@ -699,12 +797,19 @@ class CaptureOverlay(QWidget):
         return CROSSHAIR
 
     def _update_cursor(self, point: QPointF, *, refresh_native: bool = False) -> None:
-        pointer = self._canvas_pointer(point)
-        if pointer is None:
+        target = self._pointer_at(point)
+        if target is None:
             return
-        self._cursors.apply_qt(self, pointer)
-        if (refresh_native or self._origin is not None or self._mark_drag is not None) and self._cursors.owns_pointer(
-            self, include_hover=refresh_native,
+        pointer, over_control = target
+        if not over_control:
+            self._cursors.apply_qt(self, pointer)
+        if self._text_editor.isVisible() and self._text_editor.cursor().shape() != pointer and (
+            self._text_drag_offset is not None or self.childAt(point.toPoint()) is self._text_editor
+        ):
+            self._text_editor.setCursor(pointer)
+        if (refresh_native or over_control or self._origin is not None or self._mark_drag is not None
+                or self._text_drag_offset is not None) and self._cursors.owns_pointer(
+            self, include_hover=refresh_native or over_control,
         ):
             self._cursors.apply_native(self, pointer)
 
@@ -763,8 +868,13 @@ class CaptureOverlay(QWidget):
             painter.drawRoundedRect(bounds, 1.25, 1.25)
 
     def _paint_mark_handles(self, painter: QPainter) -> None:
+        if self._text_anchor is not None:
+            painter.setPen(QPen(QColor("#087e86"), 1.0, Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(self._text_outline)
+            return
         mark = self._current_selected_mark()
-        if mark is None:
+        if mark is None or mark.kind == "text":
             return
         handles = self._mark_handles(mark)
         if not handles:
@@ -796,13 +906,12 @@ class CaptureOverlay(QWidget):
     @staticmethod
     def _mark_bounds(mark: Mark) -> QRectF:
         if mark.kind == "text":
-            font = QFont("Microsoft YaHei UI")
-            font.setPixelSize(max(1, mark.style.size))
-            font.setWeight(QFont.Weight.DemiBold)
-            metrics = QFontMetricsF(font)
+            metrics = QFontMetricsF(annotation_font(mark.style))
+            lines = mark.text.splitlines() or [""]
             return QRectF(
                 mark.points[0].x(), mark.points[0].y(),
-                metrics.horizontalAdvance(mark.text), metrics.height(),
+                max(8.0, *(metrics.horizontalAdvance(line) for line in lines)),
+                metrics.height() + (len(lines) - 1) * metrics.lineSpacing(),
             )
         xs = [point.x() for point in mark.points]
         ys = [point.y() for point in mark.points]
@@ -935,6 +1044,13 @@ class CaptureOverlay(QWidget):
         self._update_annotation_view()
 
     def _render_state(self) -> tuple[Mark | None, tuple[int, Mark] | None]:
+        if self._text_anchor is not None:
+            # While the IME owns the composition it paints its candidate text and formatting.
+            text = "" if self._text_editor.preedit else self._text_editor.text()
+            mark = self._text_edit_mark(text)
+            if self._text_index is not None:
+                return None, (self._text_index, mark)
+            return mark if text else None, None
         if self._mark_drag is not None:
             drag = self._mark_drag
             if not self._valid_mark(drag.current):
@@ -1119,24 +1235,91 @@ class CaptureOverlay(QWidget):
                 self._annotations.replace(index, replace(mark, style=style))
         if kind in _BRUSH_CURSORS:
             self._schedule_cursor_refresh()
+        if kind == "text":
+            self._update_text_editor()
         self._update_annotation_view()
 
     def _start_text(self, point: QPointF, index: int | None) -> None:
         self._text_anchor = point
         self._text_index = index
         self._text_editor.setText(self._annotations.get(index).text if index is not None else "")
-        width = min(260, self.width() - 16)
-        height = self._text_editor.sizeHint().height()
-        x = max(8, min(round(point.x()), self.width() - width - 8))
-        y = max(8, min(round(point.y()), self.height() - height - 8))
-        self._text_editor.setGeometry(x, y, width, height)
+        self._update_text_editor()
         for shortcut in self._capture_shortcuts:
             shortcut.setEnabled(False)
+        # A click on the outline can go to the canvas; keep keyboard focus in the editor.
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self._text_editor.show()
         self._text_editor.raise_()
         self._text_editor.setFocus()
         if index is not None:
             self._text_editor.selectAll()
+
+    def _text_edit_mark(self, text: str) -> Mark:
+        assert self._text_anchor is not None
+        if self._text_index is not None:
+            return replace(self._annotations.get(self._text_index), points=(self._text_anchor,), text=text)
+        return Mark("text", (self._text_anchor,), self._toolbar.style_for("text"), text)
+
+    @Slot()
+    def _update_text_editor(self) -> None:
+        if self._text_anchor is None:
+            return
+        editor = self._text_editor
+        mark = self._text_edit_mark(editor.text() + editor.preedit)
+        font = annotation_font(mark.style)
+        if editor.font() != font:
+            editor.setFont(font)
+        editor.set_ink(QColor(mark.style.color))
+        content = self._mark_bounds(mark)
+        pad = _TEXT_OUTLINE_PADDING
+        self._text_outline = content.adjusted(-pad, -pad, pad, pad)
+        bounds = content.adjusted(0, 0, 8, 3).toAlignedRect()
+        editor.setGeometry(bounds)
+        clip = bounds.intersected(self._selection.toAlignedRect()).translated(-bounds.topLeft())
+        editor.setMask(QRegion(clip))
+        self.update()
+
+    def _over_text_outline(self, point: QPointF) -> bool:
+        if self._text_anchor is None or not self._selection.contains(point):
+            return False
+        hit = _TEXT_OUTLINE_HIT
+        return (
+            self._text_outline.adjusted(-hit, -hit, hit, hit).contains(point)
+            and not self._text_outline.adjusted(hit, hit, -hit, -hit).contains(point)
+        )
+
+    def _handle_text_drag(self, event: QMouseEvent, point: QPointF) -> bool:
+        if self._text_anchor is None:
+            return False
+        event_type = event.type()
+        left = event.button() == Qt.MouseButton.LeftButton
+        if event_type in {QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick}:
+            if not left or not self._over_text_outline(point):
+                return False
+            self._text_drag_offset = point - self._text_anchor
+            self._text_editor.setFocus(Qt.FocusReason.MouseFocusReason)
+        elif self._text_drag_offset is not None and (
+            event_type == QEvent.Type.MouseMove or (event_type == QEvent.Type.MouseButtonRelease and left)
+        ):
+            anchor = self._annotation_point(point - self._text_drag_offset)
+            if anchor != self._text_anchor:
+                self._text_anchor = anchor
+                self._update_text_editor()
+                QGuiApplication.inputMethod().update(Qt.InputMethodQuery.ImCursorRectangle)
+            if event_type == QEvent.Type.MouseButtonRelease:
+                self._text_drag_offset = None
+                self._text_editor.setFocus(Qt.FocusReason.MouseFocusReason)
+                self._schedule_cursor_refresh()
+        else:
+            return False
+        self._update_cursor(point, refresh_native=True)
+        event.accept()
+        return True
+
+    @Slot()
+    def _accept_text(self) -> None:
+        if not self._text_editor.preedit:
+            self._commit_text()
 
     @Slot()
     def _cancel_text(self) -> None:
@@ -1144,26 +1327,36 @@ class CaptureOverlay(QWidget):
             return
         self._text_anchor = None
         self._text_index = None
+        self._text_drag_offset = None
+        if self._text_editor.preedit:
+            QGuiApplication.inputMethod().reset()
+            if self._text_editor.preedit:
+                self._text_editor.inputMethodEvent(QInputMethodEvent())
         self._text_editor.hide()
         self._text_editor.clear()
         for shortcut in self._capture_shortcuts:
             shortcut.setEnabled(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setFocus()
         self._schedule_cursor_refresh()
+        self.update()
 
     @Slot()
     def _commit_text(self) -> None:
         if self._text_anchor is None:
             return
-        anchor, index, text = self._text_anchor, self._text_index, self._text_editor.text().strip()
+        if self._text_editor.preedit:
+            QGuiApplication.inputMethod().commit()
+        index, text = self._text_index, self._text_editor.text()
+        mark = self._text_edit_mark(text)
         self._cancel_text()
-        if not text:
+        if not text.strip():
             return
         if index is not None:
             existing = self._annotations.get(index)
-            self._annotations.replace(index, replace(existing, text=text))
+            if existing != mark:
+                self._annotations.replace(index, mark)
         else:
-            mark = Mark("text", (anchor,), self._toolbar.style_for("text"), text)
             index = self._annotations.add(mark)
         self._select_mark(index)
         self._update_annotation_view()
@@ -1261,17 +1454,20 @@ class CaptureOverlay(QWidget):
             self._schedule_cursor_refresh()
             return
 
+        image = self._output_image()
+        # The composited screenshot remains fully opaque when its source is opaque.
+        if not self._frame.hasAlphaChannel() and image.hasAlphaChannel():
+            image = image.convertToFormat(QImage.Format.Format_RGB32)
+
         output = QSaveFile(path)
-        if (
-            not output.open(QIODevice.OpenModeFlag.WriteOnly)
-            or not self._output_image().save(output, "PNG")
-            or not output.commit()
-        ):
+        written = output.open(QIODevice.OpenModeFlag.WriteOnly) and image.save(output, "PNG")
+        size_bytes = output.pos() if written else 0
+        if not written or not output.commit():
             QMessageBox.warning(self, "保存失败", "无法写入该位置，请选择其他文件夹。")
             self._schedule_cursor_refresh()
             return
         self._finish()
-        self.image_saved.emit(path)
+        self.image_saved.emit(path, image.size(), size_bytes)
 
     def _choose_png_path(self) -> str:
         folder = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation)
